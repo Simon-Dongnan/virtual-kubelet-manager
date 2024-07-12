@@ -16,20 +16,14 @@ package root
 
 import (
 	"context"
-	"crypto/tls"
-	"github.com/koupleless/arkctl/v1/service/ark"
-	"net/http"
-	"runtime"
-
-	podlet "github.com/koupleless/virtual-kubelet/java/pod/let"
-	podnode "github.com/koupleless/virtual-kubelet/java/pod/node"
+	"errors"
+	"fmt"
+	"github.com/google/uuid"
+	"github.com/koupleless/virtual-kubelet/common/mqtt"
+	"github.com/koupleless/virtual-kubelet/java/controller"
+	"github.com/koupleless/virtual-kubelet/java/model"
 	"github.com/spf13/cobra"
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
-	"github.com/virtual-kubelet/virtual-kubelet/node"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
-	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
-	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 )
 
 // NewCommand creates a new top-level command.
@@ -54,124 +48,47 @@ func runRootCommand(ctx context.Context, c Opts) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if c.PodSyncWorkers == 0 {
-		return errdefs.InvalidInput("pod sync workers must be greater than 0")
-	}
-
-	// Ensure API client.
-	clientSet, err := nodeutil.ClientsetFromEnv(c.KubeConfigPath)
-	if err != nil {
-		return err
-	}
-
-	// Set-up the node provider.
-	mux := http.NewServeMux()
-	apiConfig, err := getAPIConfig(c)
-	if err != nil {
-		return err
-	}
-
-	var provider *podlet.BaseProvider
-	cm, err := nodeutil.NewNode(
-		c.NodeName,
-		func(config nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
-			arkService := ark.BuildService(context.Background())
-			nodeProvider := podnode.NewVirtualKubeletNode(arkService)
-			// initialize node spec on bootstrap
-			provider = podlet.NewBaseProvider(config.Node.Namespace, arkService, clientSet)
-			nodeProvider.Register(ctx, config.Node)
-			return provider, nodeProvider, nil
-		},
-		func(cfg *nodeutil.NodeConfig) error {
-			cfg.KubeconfigPath = c.KubeConfigPath
-			cfg.Handler = mux
-			cfg.InformerResyncPeriod = c.InformerResyncPeriod
-			cfg.NodeSpec.Status.NodeInfo.Architecture = runtime.GOARCH
-			cfg.NodeSpec.Status.NodeInfo.OperatingSystem = c.OperatingSystem
-			cfg.HTTPListenAddr = apiConfig.Addr
-			cfg.StreamCreationTimeout = apiConfig.StreamCreationTimeout
-			cfg.StreamIdleTimeout = apiConfig.StreamIdleTimeout
-			cfg.DebugHTTP = true
-
-			cfg.NumWorkers = c.PodSyncWorkers
-			return nil
-		},
-		nodeutil.WithClient(clientSet),
-		//setAuth(c.NodeName, apiConfig),
-		//nodeutil.WithTLSConfig(
-		//	nodeutil.WithKeyPairFromPath(apiConfig.CertPath, apiConfig.KeyPath),
-		//maybeCA(apiConfig.CACertPath),
-		//),
-		nodeutil.AttachProviderRoutes(mux),
-	)
-	if err != nil {
-		return err
-	}
-	kn, err := podnode.NewKouplelessNode(cm, clientSet, c.NodeName)
-	if err != nil {
-		return err
-	}
-
 	if err := setupTracing(ctx, c); err != nil {
 		return err
 	}
 
+	clientID := uuid.New().String()
+
 	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
-		"provider":         c.Provider,
-		"operatingSystem":  c.OperatingSystem,
-		"node":             c.NodeName,
-		"watchedNamespace": c.KubeNamespace,
+		"operatingSystem": c.OperatingSystem,
+		"clientID":        clientID,
 	}))
 
-	go provider.Run(ctx)
-	go kn.Run(ctx, c.PodSyncWorkers) //nolint:errcheck
+	config := model.BuildBaseRegisterControllerConfig{
+		MqttConfig: &mqtt.ClientConfig{
+			Broker:        c.MqttBroker,
+			Port:          c.MqttPort,
+			ClientID:      fmt.Sprintf("module-controller@@@%s", clientID),
+			Username:      c.MqttUsername,
+			Password:      c.MqttPassword,
+			CAPath:        c.MqttCAPath,
+			ClientCrtPath: c.MqttClientCrtPath,
+			ClientKeyPath: c.MqttClientKeyPath,
+			CleanSession:  true,
+		},
+		KubeConfigPath: c.KubeConfigPath,
+	}
 
-	defer func() {
-		log.G(ctx).Debug("Waiting for controllers to be done")
-		cancel()
-		<-kn.Done()
-	}()
-
-	log.G(ctx).Info("Waiting for controller to be ready")
-	if err := kn.WaitReady(ctx, c.StartupTimeout); err != nil {
+	registerController, err := controller.NewBaseRegisterController(&config)
+	if err != nil {
 		return err
 	}
 
-	log.G(ctx).Info("Ready")
+	if registerController == nil {
+		return errors.New("register controller is nil")
+	}
+
+	registerController.Run(ctx)
 
 	select {
 	case <-ctx.Done():
-	case <-cm.Done():
-		return cm.Err()
-	}
-	return nil
-}
-
-func setAuth(node string, apiCfg *apiServerConfig) nodeutil.NodeOpt {
-	if apiCfg.CACertPath == "" {
-		return func(cfg *nodeutil.NodeConfig) error {
-			cfg.Handler = api.InstrumentHandler(nodeutil.WithAuth(nodeutil.NoAuth(), cfg.Handler))
-			return nil
-		}
+	case <-registerController.Done():
 	}
 
-	return func(cfg *nodeutil.NodeConfig) error {
-		auth, err := nodeutil.WebhookAuth(cfg.Client, node, func(cfg *nodeutil.WebhookAuthConfig) error {
-			var err error
-			cfg.AuthnConfig.ClientCertificateCAContentProvider, err = dynamiccertificates.NewDynamicCAContentFromFile("ca-cert-bundle", apiCfg.CACertPath)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-		cfg.Handler = api.InstrumentHandler(nodeutil.WithAuth(auth, cfg.Handler))
-		return nil
-	}
-}
-
-func maybeCA(p string) func(*tls.Config) error {
-	if p == "" {
-		return func(*tls.Config) error { return nil }
-	}
-	return nodeutil.WithCAFromPath(p)
+	return registerController.Err()
 }

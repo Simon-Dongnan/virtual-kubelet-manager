@@ -13,30 +13,39 @@ import (
 )
 
 var _ = Describe("Module Publish", func() {
-	return
+
 	const timeout = time.Second * 60
 
 	const interval = time.Second * 3
 
 	ctx := context.WithValue(context.Background(), "env", "module-publish-test")
-	singleModuleBiz1PodYamlFilePath := path.Join("../samples", "single_module_biz1_to_basic_base.yaml")
+	singleModuleBiz1PodYamlFilePath := path.Join("../samples", "single_module_biz1.yaml")
 	multiModulePodYamlFilePath := path.Join("../samples", "multi_module_biz1_biz2.yaml")
 
 	singleModuleBiz1Pod, err := getPodFromYamlFile(singleModuleBiz1PodYamlFilePath)
 
+	It("should create successfully", func() {
+		Expect(err).NotTo(HaveOccurred())
+		Expect(singleModuleBiz1Pod).NotTo(BeNil())
+	})
+
+	var mockBase *BaseMock
+	nodeId := "test-base"
+
+	It("mock base should start successfully", func() {
+		mockBase = NewBaseMock(nodeId, "base", "1.1.1", baseMqttClient)
+		go mockBase.Run()
+		Eventually(func() bool {
+			_, err := k8sClient.CoreV1().Nodes().Get(ctx, nodeId, metav1.GetOptions{})
+			return !errors.IsNotFound(err)
+		}, timeout, interval).Should(BeTrue())
+	})
+
 	Context("create single module pod", func() {
 		It("should create successfully", func() {
-			Expect(err).NotTo(HaveOccurred())
-			Expect(singleModuleBiz1Pod).NotTo(BeNil())
-			_, err = k8sClient.CoreV1().Pods(DefaultNamespace).Create(ctx, singleModuleBiz1Pod, metav1.CreateOptions{})
-			Expect(err).NotTo(HaveOccurred())
-		})
-
-		It("should be pending status", func() {
-			pod, err := k8sClient.CoreV1().Pods(DefaultNamespace).Get(ctx, singleModuleBiz1Pod.Name, metav1.GetOptions{})
+			pod, err := k8sClient.CoreV1().Pods(DefaultNamespace).Create(ctx, singleModuleBiz1Pod, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(pod).NotTo(BeNil())
-			Expect(pod.Status.Phase).To(Equal(corev1.PodPending))
 		})
 
 		It("should change to running status finally", func() {
@@ -76,7 +85,6 @@ var _ = Describe("Module Publish", func() {
 	multiModulePod, err := getPodFromYamlFile(multiModulePodYamlFilePath)
 
 	Context("create multi module pod", func() {
-
 		It("should create successfully", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(multiModulePod).NotTo(BeNil())
@@ -120,6 +128,38 @@ var _ = Describe("Module Publish", func() {
 		It("should delete finally", func() {
 			Eventually(func() bool {
 				_, err := k8sClient.CoreV1().Pods(DefaultNamespace).Get(ctx, multiModulePod.Name, metav1.GetOptions{})
+				return errors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
+		})
+	})
+
+	Context("base exit", func() {
+		It("publish a module and should be running status finally", func() {
+			pod, err := k8sClient.CoreV1().Pods(DefaultNamespace).Create(ctx, singleModuleBiz1Pod, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pod).NotTo(BeNil())
+			Eventually(func() bool {
+				pod, err := k8sClient.CoreV1().Pods(DefaultNamespace).Get(ctx, singleModuleBiz1Pod.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(pod).NotTo(BeNil())
+				logrus.Infof("pod status: %v", pod.Status)
+				return pod.Status.Phase == corev1.PodRunning
+			}, timeout, interval).Should(BeTrue())
+		})
+
+		It("base exit", func() {
+			if mockBase != nil {
+				mockBase.Exit()
+			}
+			Eventually(func() bool {
+				_, err := k8sClient.CoreV1().Nodes().Get(ctx, nodeId, metav1.GetOptions{})
+				return errors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
+		})
+
+		It("pod should be deleted", func() {
+			Eventually(func() bool {
+				_, err := k8sClient.CoreV1().Pods(DefaultNamespace).Get(ctx, singleModuleBiz1Pod.Name, metav1.GetOptions{})
 				return errors.IsNotFound(err)
 			}, timeout, interval).Should(BeTrue())
 		})

@@ -5,6 +5,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
@@ -38,6 +39,20 @@ var _ = Describe("Module DaemonSet", func() {
 		selector = labels.NewSelector().Add(*requirement)
 	})
 
+	var mockBase *BaseMock
+	var mockScaleBase *BaseMock
+	nodeId := "test-base"
+	scaleNodeId := "test-base-scale"
+
+	It("mock base should start successfully", func() {
+		mockBase = NewBaseMock(nodeId, "base", "1.1.1", baseMqttClient)
+		go mockBase.Run()
+		Eventually(func() bool {
+			_, err := k8sClient.CoreV1().Nodes().Get(ctx, nodeId, metav1.GetOptions{})
+			return !errors.IsNotFound(err)
+		}, timeout, interval).Should(BeTrue())
+	})
+
 	Context("create daemonSet", func() {
 		It("should create successfully", func() {
 			createResult, err := k8sClient.AppsV1().DaemonSets(DefaultNamespace).Create(ctx, moduleDaemonSet, metav1.CreateOptions{})
@@ -65,10 +80,12 @@ var _ = Describe("Module DaemonSet", func() {
 
 	Context("base pod scale", func() {
 		It("should base pod scale successfully", func() {
-			// version should be the same as basic base pod, mocking the base pod scale situation
-			startBasePod(MockBasePodName, BasicBasePodVersion, MockVNodeListPort, func(pod *corev1.Pod) {
-				mockBasePod = pod
-			})
+			mockScaleBase = NewBaseMock(scaleNodeId, "base", "1.1.1", baseMqttClient)
+			go mockScaleBase.Run()
+			Eventually(func() bool {
+				_, err := k8sClient.CoreV1().Nodes().Get(ctx, scaleNodeId, metav1.GetOptions{})
+				return !errors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
 		})
 
 		It("should all of the pod become running finally and the num of pods should be 2", func() {
@@ -138,19 +155,26 @@ var _ = Describe("Module DaemonSet", func() {
 		})
 	})
 
-	// base pod update is delete then create new one, creation has tested before
-	Context("base pod update", func() {
-		It("should base pod delete successfully", func() {
-			shutdownBasePod(MockBasePodName)
+	Context("base pod scale down", func() {
+		It("should scale base pod exit successfully", func() {
+			if mockScaleBase != nil {
+				mockScaleBase.Exit()
+			}
+			Eventually(func() bool {
+				_, err := k8sClient.CoreV1().Nodes().Get(ctx, scaleNodeId, metav1.GetOptions{})
+				return errors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
 		})
 
 		It("should not create new pod", func() {
-			podList, err := k8sClient.CoreV1().Pods(DefaultNamespace).List(ctx, metav1.ListOptions{
-				LabelSelector: selector.String(),
-			})
-			Expect(err).NotTo(HaveOccurred())
-			Expect(podList).NotTo(BeNil())
-			Expect(len(podList.Items)).To(Equal(1))
+			Eventually(func() bool {
+				podList, err := k8sClient.CoreV1().Pods(DefaultNamespace).List(ctx, metav1.ListOptions{
+					LabelSelector: selector.String(),
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(podList).NotTo(BeNil())
+				return len(podList.Items) == 1
+			}, timeout, interval).Should(BeTrue())
 		})
 	})
 
@@ -182,5 +206,15 @@ var _ = Describe("Module DaemonSet", func() {
 				return len(podList.Items) == 0
 			}, timeout, interval).Should(BeTrue())
 		})
+	})
+
+	It("mock base should exit", func() {
+		if mockBase != nil {
+			mockBase.Exit()
+		}
+		Eventually(func() bool {
+			_, err := k8sClient.CoreV1().Nodes().Get(ctx, nodeId, metav1.GetOptions{})
+			return errors.IsNotFound(err)
+		}, timeout, interval).Should(BeTrue())
 	})
 })

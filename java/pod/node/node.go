@@ -17,20 +17,14 @@ package node
 import (
 	"context"
 	"github.com/koupleless/arkctl/v1/service/ark"
-	"github.com/pkg/errors"
-	"github.com/virtual-kubelet/virtual-kubelet/log"
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"os"
-	"strconv"
-	"sync"
-	"time"
-
-	"github.com/koupleless/virtual-kubelet/common/helper"
 	"github.com/koupleless/virtual-kubelet/java/common"
 	"github.com/koupleless/virtual-kubelet/java/model"
+	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sync"
+	"time"
 )
 
 type NodeProvider interface {
@@ -46,77 +40,22 @@ var modelUtils = common.ModelUtils{}
 type VirtualKubeletNode struct {
 	sync.Mutex
 	nodeConfig *model.BuildVirtualNodeConfig
-	arkService ark.Service
 
 	nodeInfo *corev1.Node
 
 	notify func(*corev1.Node)
 }
 
-func NewVirtualKubeletNode(arkService ark.Service) *VirtualKubeletNode {
-	techStack := os.Getenv("TECH_STACK")
-	vNodeCapacityStr := os.Getenv("VNODE_POD_CAPACITY")
-	if len(vNodeCapacityStr) == 0 {
-		vNodeCapacityStr = "1"
-	}
-
-	vnode := model.BuildVirtualNodeConfig{
-		NodeIP:       os.Getenv("BASE_POD_IP"),
-		TechStack:    techStack,
-		Version:      os.Getenv("VNODE_VERSION"),
-		VPodCapacity: int(helper.MustReturnFirst[int64](strconv.ParseInt(vNodeCapacityStr, 10, 64))),
-	}
-
-	return &VirtualKubeletNode{
-		nodeConfig: &vnode,
-		arkService: arkService,
-		notify: func(node *corev1.Node) {
-			// default notify func
-			log.G(context.Background()).Info("node status callback not registered")
-		},
-	}
-}
-
-func (v *VirtualKubeletNode) Register(_ context.Context, node *corev1.Node) error {
-	modelUtils.BuildVirtualNode(v.nodeConfig, v.arkService, node)
+func (v *VirtualKubeletNode) Notify(data ark.HealthData) {
 	v.Lock()
-	v.nodeInfo = node.DeepCopy()
-	v.Unlock()
-	return nil
-}
-
-func (v *VirtualKubeletNode) Ping(ctx context.Context) error {
-	// TODO implement base instance healthy check, waiting for arklet to support base liveness check, default 10 second
-	_, err := v.arkService.QueryAllBiz(ctx, ark.QueryAllArkBizRequest{
-		HostName: model.LoopBackIp,
-		Port:     model.ArkServicePort,
-	})
-	if err != nil {
-		return errors.Wrap(err, "base not activated")
+	defer v.Unlock()
+	if v.nodeInfo == nil {
+		return
 	}
-	return nil
-}
-
-func (v *VirtualKubeletNode) NotifyNodeStatus(_ context.Context, cb func(*corev1.Node)) {
-	// todo: sync base status to k8s, call the callback func to submit the node status
-	// can only update node status, Annotations and labels, implement it if need to update these information
-	v.notify = cb
-	// start a timed task, sync node status periodically
-	go common.TimedTaskWithInterval("sync node status", time.Second*3, v.checkCapacityAndNotify)
-}
-
-// check curr base process capacity
-func (v *VirtualKubeletNode) checkCapacityAndNotify(ctx context.Context) {
-	// TODO do capacity check here, update local node status
-	var err error
-	v.Lock()
 	// node status
 	nodeReadyStatus := corev1.ConditionTrue
 	nodeReadyMessage := ""
-	if err != nil {
-		nodeReadyStatus = corev1.ConditionFalse
-		nodeReadyMessage = err.Error()
-	}
+	v.nodeInfo.Status.Phase = corev1.NodeRunning
 	conditions := []corev1.NodeCondition{
 		{
 			Type:   corev1.NodeReady,
@@ -127,11 +66,38 @@ func (v *VirtualKubeletNode) checkCapacityAndNotify(ctx context.Context) {
 			Message: nodeReadyMessage,
 		},
 	}
-	// TODO check curr mem, set mem pressure
 	v.nodeInfo.Status.Conditions = conditions
-	// TODO calculate number based on arklet
-	v.nodeInfo.Status.Capacity[corev1.ResourceMemory] = resource.MustParse("500Gi")
-	v.nodeInfo.Status.Allocatable[corev1.ResourceMemory] = resource.MustParse("300Gi")
-	v.Unlock()
+	if data.Jvm.JavaMaxMetaspace != -1 {
+		v.nodeInfo.Status.Capacity[corev1.ResourceMemory] = common.ConvertByteNumToResourceQuantity(data.Jvm.JavaMaxMetaspace)
+	}
+	if data.Jvm.JavaCommittedMetaspace != -1 && data.Jvm.JavaMaxMetaspace != -1 {
+		v.nodeInfo.Status.Allocatable[corev1.ResourceMemory] = common.ConvertByteNumToResourceQuantity(data.Jvm.JavaMaxMetaspace - data.Jvm.JavaCommittedMetaspace)
+	}
 	v.notify(v.nodeInfo.DeepCopy())
+}
+
+func NewVirtualKubeletNode(config model.BuildVirtualNodeConfig) *VirtualKubeletNode {
+	return &VirtualKubeletNode{
+		nodeConfig: &config,
+		notify: func(_ *corev1.Node) {
+			// default notify func
+			log.G(context.Background()).Info("node status callback not registered")
+		},
+	}
+}
+
+func (v *VirtualKubeletNode) Register(_ context.Context, node *corev1.Node) error {
+	modelUtils.BuildVirtualNode(v.nodeConfig, node)
+	v.Lock()
+	v.nodeInfo = node.DeepCopy()
+	v.Unlock()
+	return nil
+}
+
+func (v *VirtualKubeletNode) Ping(ctx context.Context) error {
+	return nil
+}
+
+func (v *VirtualKubeletNode) NotifyNodeStatus(_ context.Context, cb func(*corev1.Node)) {
+	v.notify = cb
 }

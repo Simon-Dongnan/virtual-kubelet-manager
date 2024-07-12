@@ -14,10 +14,21 @@
 
 package model
 
+import (
+	"github.com/koupleless/virtual-kubelet/common/mqtt"
+)
+
 const (
-	LoopBackIp            = "127.0.0.1"
-	ArkServicePort        = 1238
-	VirtualKubeletVersion = "0.0.1"
+	CommandHealth       = "health"
+	CommandQueryAllBiz  = "queryAllBiz"
+	CommandInstallBiz   = "installBiz"
+	CommandUnInstallBiz = "uninstallBiz"
+)
+
+type contextKey string
+
+const (
+	TimedTaskNameKey contextKey = "TimedTaskName"
 )
 
 type BuildVirtualNodeConfig struct {
@@ -27,9 +38,40 @@ type BuildVirtualNodeConfig struct {
 	// TechStack is the underlying tech stack of runtime
 	TechStack string `json:"techStack"`
 
+	// BizName is the master biz name of runtime
+	BizName string `json:"bizName"`
+
 	// Version is the version of ths underlying runtime
 	Version string `json:"version"`
+}
 
-	// VPodCapacity limits the number of vPods that can be created on this node
-	VPodCapacity int `json:"vPodCapacity"`
+type BuildBaseRegisterControllerConfig struct {
+	// MqttConfig is the config of mqtt client
+	MqttConfig *mqtt.ClientConfig
+
+	// KubeConfigPath is the path of k8s client
+	KubeConfigPath string
+}
+
+type BuildKouplelessNodeConfig struct {
+	// KubeConfigPath is the path of kube config file
+	KubeConfigPath string
+
+	// MqttClient is the mqtt client, for sub and pub
+	MqttClient *mqtt.Client
+
+	// NodeID is the device id of base
+	NodeID string
+
+	// NodeIP is the device ip of base
+	NodeIP string
+
+	// TechStack is the base tech stack, default java
+	TechStack string
+
+	// BizName is the base master biz name
+	BizName string
+
+	// BizVersion is the base master biz version
+	BizVersion string
 }

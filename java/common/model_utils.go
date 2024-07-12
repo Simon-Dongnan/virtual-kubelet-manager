@@ -19,11 +19,11 @@ import (
 	"github.com/koupleless/arkctl/common/fileutil"
 	"github.com/koupleless/arkctl/v1/service/ark"
 	"github.com/koupleless/virtual-kubelet/java/model"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api/statsv1alpha1"
+	"github.com/virtual-kubelet/virtual-kubelet/log"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"strconv"
+	"time"
 )
 
 // ModelUtils
@@ -73,8 +73,7 @@ func (c ModelUtils) GetBizModelsFromCoreV1Pod(pod *corev1.Pod) []*ark.BizModel {
 	return ret
 }
 
-func (c ModelUtils) TranslateArkBizInfoToV1ContainerStatus(bizModel *ark.BizModel, bizInfo *ark.ArkBizInfo, baseProcessRunning bool) *corev1.ContainerStatus {
-	// todo: wait arklet support the timestamp return in bizInfo
+func (c ModelUtils) TranslateArkBizInfoToV1ContainerStatus(bizModel *ark.BizModel, bizInfo *ark.ArkBizInfo) *corev1.ContainerStatus {
 	started :=
 		bizInfo != nil && bizInfo.BizState == "ACTIVATED"
 
@@ -89,17 +88,9 @@ func (c ModelUtils) TranslateArkBizInfoToV1ContainerStatus(bizModel *ark.BizMode
 	}
 
 	if bizInfo == nil {
-		// not installing
-		if !baseProcessRunning {
-			ret.State.Waiting = &corev1.ContainerStateWaiting{
-				Reason:  "BaseDown",
-				Message: "Base process down, waiting for restart",
-			}
-		} else {
-			ret.State.Waiting = &corev1.ContainerStateWaiting{
-				Reason:  "BizPending",
-				Message: "Biz is waiting for installing",
-			}
+		ret.State.Waiting = &corev1.ContainerStateWaiting{
+			Reason:  "BizPending",
+			Message: "Biz is waiting for installing",
 		}
 		return ret
 	}
@@ -117,33 +108,70 @@ func (c ModelUtils) TranslateArkBizInfoToV1ContainerStatus(bizModel *ark.BizMode
 	// therefore, the operation method should all be performed in sync way.
 	// and there would be no waiting state
 	if bizInfo.BizState == "ACTIVATED" {
+		latestActivatedTime := time.UnixMilli(0)
+		for _, record := range bizInfo.BizStateRecords {
+			if record.State != "ACTIVATED" {
+				continue
+			}
+			if len(record.ChangeTime) < 3 {
+				continue
+			}
+			changeTime, err := time.Parse("2006-01-02 15:04:05", record.ChangeTime[:len(record.ChangeTime)-3])
+			if err != nil {
+				log.G(context.Background()).Errorf("failed to parse change time %s", record.ChangeTime)
+				continue
+			}
+			if changeTime.UnixMilli() > latestActivatedTime.UnixMilli() {
+				latestActivatedTime = changeTime
+			}
+		}
 		ret.State.Running = &corev1.ContainerStateRunning{
 			// for now we can just leave it empty,
 			// in the future when the arklet supports this, we can fill this field.
-			StartedAt: metav1.Time{},
+			StartedAt: metav1.Time{
+				Time: latestActivatedTime,
+			},
 		}
 	}
 
-	// todo: need arklet support get biz status of deactivated
 	if bizInfo.BizState == "DEACTIVATED" {
+		latestDeactivatedTime := time.UnixMilli(0)
+		for _, record := range bizInfo.BizStateRecords {
+			if record.State != "DEACTIVATED" {
+				continue
+			}
+			if len(record.ChangeTime) < 3 {
+				continue
+			}
+			changeTime, err := time.Parse("2006-01-02 15:04:05", record.ChangeTime[:len(record.ChangeTime)-3])
+			if err != nil {
+				log.G(context.Background()).Errorf("failed to parse change time %s", record.ChangeTime)
+				continue
+			}
+			if changeTime.UnixMilli() > latestDeactivatedTime.UnixMilli() {
+				latestDeactivatedTime = changeTime
+			}
+		}
 		ret.State.Terminated = &corev1.ContainerStateTerminated{
-			ExitCode:    1,
-			Reason:      "BizDeactivated",
-			Message:     "Biz is deactivated",
-			FinishedAt:  metav1.Time{},
-			StartedAt:   metav1.Time{},
+			ExitCode: 1,
+			Reason:   "BizDeactivated",
+			Message:  "Biz is deactivated",
+			FinishedAt: metav1.Time{
+				Time: latestDeactivatedTime,
+			},
 			ContainerID: c.GetBizIdentityFromBizModel(bizModel),
 		}
 	}
 	return ret
 }
 
-func (c ModelUtils) BuildVirtualNode(config *model.BuildVirtualNodeConfig, arkService ark.Service, node *corev1.Node) {
+func (c ModelUtils) BuildVirtualNode(config *model.BuildVirtualNodeConfig, node *corev1.Node) {
 	if node.ObjectMeta.Labels == nil {
 		node.ObjectMeta.Labels = make(map[string]string)
 	}
 	node.Labels["base.koupleless.io/stack"] = config.TechStack
 	node.Labels["base.koupleless.io/version"] = config.Version
+	node.Labels["base.koupleless.io/name"] = config.BizName
 	node.Spec.Taints = []corev1.Taint{
 		{
 			Key:    "schedule.koupleless.io/virtual-node",
@@ -152,7 +180,7 @@ func (c ModelUtils) BuildVirtualNode(config *model.BuildVirtualNodeConfig, arkSe
 		},
 	}
 	node.Status = corev1.NodeStatus{
-		Phase: corev1.NodeRunning,
+		Phase: corev1.NodePending,
 		Addresses: []corev1.NodeAddress{
 			{
 				Type:    corev1.NodeInternalIP,
@@ -162,73 +190,14 @@ func (c ModelUtils) BuildVirtualNode(config *model.BuildVirtualNodeConfig, arkSe
 		Conditions: []corev1.NodeCondition{
 			{
 				Type:   corev1.NodeReady,
-				Status: corev1.ConditionTrue,
+				Status: corev1.ConditionFalse,
 			},
 		},
 		Capacity: map[corev1.ResourceName]resource.Quantity{
-			corev1.ResourcePods: resource.MustParse(strconv.Itoa(config.VPodCapacity)),
+			corev1.ResourcePods: resource.MustParse("2000"),
 		},
-		Allocatable: map[corev1.ResourceName]resource.Quantity{},
-	}
-	// TODO add base process liveness check, now use query for check
-	// for init status, need to check mem
-	_, err := arkService.QueryAllBiz(context.Background(), ark.QueryAllArkBizRequest{
-		HostName: model.LoopBackIp,
-		Port:     model.ArkServicePort,
-	})
-	if err != nil {
-		// base process not ready
-		node.Status = corev1.NodeStatus{
-			Phase: corev1.NodePending,
-			Addresses: []corev1.NodeAddress{
-				{
-					Type:    corev1.NodeInternalIP,
-					Address: config.NodeIP,
-				},
-			},
-			Conditions: []corev1.NodeCondition{
-				{
-					Type:   corev1.NodeReady,
-					Status: corev1.ConditionFalse,
-				},
-			},
-			NodeInfo: corev1.NodeSystemInfo{
-				KubeletVersion: model.VirtualKubeletVersion,
-			},
-		}
-	} else {
-		// TODO sync capacity
-	}
-}
-
-func (c ModelUtils) TranslatePodToSummaryPodStats(pod *corev1.Pod) statsv1alpha1.PodStats {
-	// read curr vm stats
-	containerStatsList := make([]statsv1alpha1.ContainerStats, len(pod.Spec.Containers))
-	for index, container := range pod.Spec.Containers {
-		containerStatsList[index] = c.TranslateContainerToSummaryContainerStats(&container)
-	}
-	return statsv1alpha1.PodStats{
-		PodRef: statsv1alpha1.PodReference{
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-			UID:       string(pod.UID),
+		Allocatable: map[corev1.ResourceName]resource.Quantity{
+			corev1.ResourcePods: resource.MustParse("2000"),
 		},
-		StartTime:  *pod.Status.StartTime,
-		Containers: containerStatsList,
-		CPU: &statsv1alpha1.CPUStats{
-			Time:                 metav1.Time{},
-			UsageNanoCores:       nil,
-			UsageCoreNanoSeconds: nil,
-		},
-		Memory:           nil,
-		Network:          nil,
-		VolumeStats:      nil,
-		EphemeralStorage: nil,
-		ProcessStats:     nil,
 	}
-}
-
-func (c ModelUtils) TranslateContainerToSummaryContainerStats(container *corev1.Container) statsv1alpha1.ContainerStats {
-	// TODO implement later
-	return statsv1alpha1.ContainerStats{}
 }
